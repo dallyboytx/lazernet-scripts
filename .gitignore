@@ -1,0 +1,9 @@
+# Secrets never go in this repo
+secrets.env
+*.env
+*.key
+*.pem
+
+# Runtime
+/tmp/qbt_cookie.txt
+*.bak

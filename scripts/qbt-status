@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# qbt-status — show qBittorrent torrent status, optionally filtered by category
+# Usage: qbt-status [all|audio|audiobooks|books|movies|records|sports|tv|misc]
+
+QBT_HOST="http://localhost:8081"
+QBT_USER="admin"
+QBT_PASS="${QBT_PASSWORD:-}"
+
+if [ -z "$QBT_PASS" ] && [ -f /etc/lazernet/secrets.env ]; then
+    # shellcheck source=/dev/null
+    source /etc/lazernet/secrets.env
+    QBT_PASS="${QBT_PASSWORD:-}"
+fi
+
+if [ -z "$QBT_PASS" ]; then
+    echo "ERROR: QBT_PASSWORD not set. Source /etc/lazernet/secrets.env or set the variable." >&2
+    exit 1
+fi
+
+FILTER="${1:-all}"
+
+# Map friendly names to qbt category names
+case "$FILTER" in
+    tv|TV)          CATEGORY="TV" ;;
+    movies|Movies)  CATEGORY="Movies" ;;
+    audio|Audio)    CATEGORY="Audio" ;;
+    audiobooks)     CATEGORY="Audiobooks" ;;
+    books|Books)    CATEGORY="Books" ;;
+    records|Records) CATEGORY="Records" ;;
+    sports|Sports)  CATEGORY="Sports" ;;
+    misc)           CATEGORY="Miscellaneous" ;;
+    all|"")         CATEGORY="" ;;
+    *)              CATEGORY="$FILTER" ;;
+esac
+
+# Authenticate — get SID cookie
+SID=$(curl -sf --max-time 10 \
+    -c /tmp/qbt_cookie.txt \
+    -d "username=${QBT_USER}&password=${QBT_PASS}" \
+    "${QBT_HOST}/api/v2/auth/login" 2>/dev/null)
+
+if [ "$SID" != "Ok." ]; then
+    echo "ERROR: qbt auth failed (got: $SID)" >&2
+    exit 1
+fi
+
+# Build API URL
+URL="${QBT_HOST}/api/v2/torrents/info"
+if [ -n "$CATEGORY" ]; then
+    URL="${URL}?category=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${CATEGORY}'))")"
+fi
+
+# Fetch torrent list
+RESULT=$(curl -sf --max-time 15 \
+    -b /tmp/qbt_cookie.txt \
+    "$URL" 2>/dev/null)
+
+if [ -z "$RESULT" ] || [ "$RESULT" = "[]" ]; then
+    echo "No torrents found${CATEGORY:+ in category '$CATEGORY'}."
+    exit 0
+fi
+
+# Parse and display
+echo "$RESULT" | python3 -c "
+import json, sys
+
+data = json.load(sys.stdin)
+filter_cat = '${CATEGORY}'
+
+# Sort by state, then name
+states_order = {'downloading': 0, 'stalledDL': 1, 'uploading': 2, 'stalledUP': 3,
+                'pausedDL': 4, 'pausedUP': 5, 'checkingDL': 6, 'checkingUP': 7,
+                'error': 8, 'missingFiles': 9, 'unknown': 10}
+data.sort(key=lambda t: (states_order.get(t.get('state','unknown'), 99), t.get('name','').lower()))
+
+print(f\"{'NAME':<55} {'STATE':<14} {'PROGRESS':>8} {'SIZE':>8} {'CATEGORY'}\")
+print('-' * 100)
+
+for t in data:
+    name = t.get('name', '')[:54]
+    state = t.get('state', 'unknown')
+    progress = f\"{t.get('progress', 0)*100:.0f}%\"
+    size = t.get('size', 0)
+    if size >= 1_073_741_824:
+        size_str = f\"{size/1_073_741_824:.1f}G\"
+    elif size >= 1_048_576:
+        size_str = f\"{size/1_048_576:.0f}M\"
+    else:
+        size_str = f\"{size/1024:.0f}K\"
+    cat = t.get('category', '')
+    print(f\"{name:<55} {state:<14} {progress:>8} {size_str:>8} {cat}\")
+
+print()
+print(f\"Total: {len(data)} torrent(s)\")
+"
+
+rm -f /tmp/qbt_cookie.txt

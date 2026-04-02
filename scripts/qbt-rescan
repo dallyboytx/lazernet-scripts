@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+# qbt-rescan — trigger recheck on qBittorrent torrents, optionally filtered by category
+# Usage: qbt-rescan [all|audio|audiobooks|books|movies|records|sports|tv|misc]
+
+QBT_HOST="http://localhost:8081"
+QBT_USER="admin"
+QBT_PASS="${QBT_PASSWORD:-}"
+
+if [ -z "$QBT_PASS" ] && [ -f /etc/lazernet/secrets.env ]; then
+    # shellcheck source=/dev/null
+    source /etc/lazernet/secrets.env
+    QBT_PASS="${QBT_PASSWORD:-}"
+fi
+
+if [ -z "$QBT_PASS" ]; then
+    echo "ERROR: QBT_PASSWORD not set. Source /etc/lazernet/secrets.env or set the variable." >&2
+    exit 1
+fi
+
+FILTER="${1:-}"
+
+if [ -z "$FILTER" ]; then
+    echo "Usage: qbt-rescan [all|audio|audiobooks|books|movies|records|sports|tv|misc]"
+    echo "       qbt-rescan all  — recheck ALL torrents (use with caution)"
+    exit 1
+fi
+
+case "$FILTER" in
+    tv|TV)          CATEGORY="TV" ;;
+    movies|Movies)  CATEGORY="Movies" ;;
+    audio|Audio)    CATEGORY="Audio" ;;
+    audiobooks)     CATEGORY="Audiobooks" ;;
+    books|Books)    CATEGORY="Books" ;;
+    records|Records) CATEGORY="Records" ;;
+    sports|Sports)  CATEGORY="Sports" ;;
+    misc)           CATEGORY="Miscellaneous" ;;
+    all|"")         CATEGORY="" ;;
+    *)              CATEGORY="$FILTER" ;;
+esac
+
+# Authenticate
+SID=$(curl -sf --max-time 10 \
+    -c /tmp/qbt_cookie.txt \
+    -d "username=${QBT_USER}&password=${QBT_PASS}" \
+    "${QBT_HOST}/api/v2/auth/login" 2>/dev/null)
+
+if [ "$SID" != "Ok." ]; then
+    echo "ERROR: qbt auth failed (got: $SID)" >&2
+    exit 1
+fi
+
+# Get torrent hashes for category (or all)
+URL="${QBT_HOST}/api/v2/torrents/info"
+if [ -n "$CATEGORY" ]; then
+    URL="${URL}?category=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${CATEGORY}'))")"
+fi
+
+HASHES=$(curl -sf --max-time 15 \
+    -b /tmp/qbt_cookie.txt \
+    "$URL" 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print('|'.join(t['hash'] for t in data))
+")
+
+COUNT=$(curl -sf --max-time 15 \
+    -b /tmp/qbt_cookie.txt \
+    "$URL" 2>/dev/null | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(len(data))
+")
+
+if [ -z "$HASHES" ]; then
+    echo "No torrents found${CATEGORY:+ in category '$CATEGORY'}."
+    rm -f /tmp/qbt_cookie.txt
+    exit 0
+fi
+
+echo "Triggering recheck on ${COUNT} torrent(s)${CATEGORY:+ in '$CATEGORY'}..."
+
+# POST recheck
+RESULT=$(curl -sf --max-time 15 \
+    -b /tmp/qbt_cookie.txt \
+    -d "hashes=${HASHES}" \
+    "${QBT_HOST}/api/v2/torrents/recheck" 2>/dev/null)
+
+echo "Done. Use 'qbt-status${CATEGORY:+ $FILTER}' to monitor progress."
+
+rm -f /tmp/qbt_cookie.txt
